@@ -1,0 +1,105 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  azureSubscription: 'sc-azure-ice1'                 # exact service connection name
+  rgName: 'rg-ice1-heramb-100919492'                 # your resource group
+  acrName: 'acrheramb100919492'                      # your ACR (name only)
+  appName: 'app-ice1-heramb-100919492'               # your Web App (container) name
+  imageName: 'webapp'
+  containerPort: '8080'
+  imageTag: '$(Build.SourceVersion)'
+  loginServer: '$(acrName).azurecr.io'
+  fullImageName: '$(loginServer)/$(imageName):$(imageTag)'
+
+pool:
+  name: Default     # your self-hosted Windows agent pool
+
+stages:
+# ===================== BUILD & PUSH =====================
+- stage: Build_Push
+  displayName: Build & Push (local Docker)
+  jobs:
+  - job: BuildPush
+    displayName: Docker build & push to ACR
+    steps:
+    - checkout: self
+
+    # Optional sanity check
+    - powershell: |
+        $ErrorActionPreference = 'Stop'
+        Write-Host "PATH: $env:PATH"
+        az --version
+        docker --version
+      displayName: 'Sanity: az & docker on agent'
+
+    - task: AzureCLI@2
+      displayName: 'Login to ACR'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          $ErrorActionPreference = 'Stop'
+          az acr login --name $(acrName)
+
+    - task: PowerShell@2
+      displayName: 'Docker build & push'
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Building $(fullImageName)"
+          docker build -t "$(fullImageName)" .
+          docker push "$(fullImageName)"
+
+# ======================= DEPLOY =========================
+- stage: Deploy
+  displayName: Deploy to App Service (Linux container)
+  dependsOn: Build_Push
+  jobs:
+  - job: DeployJob
+    displayName: Configure image, identity, AcrPull, port, restart
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Assign identity + grant AcrPull + set image/port + restart'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          $ErrorActionPreference = 'Stop'
+
+          # ACR resource id
+          $acrId = (az acr show -n $(acrName) --query id -o tsv).Trim()
+
+          # Ensure system-assigned identity on Web App (idempotent)
+          az webapp identity assign --name $(appName) --resource-group $(rgName) | Out-Null
+
+          # PrincipalId for the Web App's managed identity
+          $principalId = (az webapp identity show --name $(appName) --resource-group $(rgName) --query principalId -o tsv).Trim()
+
+          # Grant AcrPull (safe if already exists)
+          az role assignment create `
+            --assignee-object-id $principalId `
+            --assignee-principal-type ServicePrincipal `
+            --role "AcrPull" `
+            --scope $acrId | Out-Null
+
+          # Point Web App to your new image
+          $fullImage = "$(loginServer)/$(imageName):$(imageTag)"
+          az webapp config container set `
+            --name $(appName) `
+            --resource-group $(rgName) `
+            --docker-custom-image-name $fullImage | Out-Null
+
+          # Ensure correct port
+          az webapp config appsettings set `
+            --name $(appName) `
+            --resource-group $(rgName) `
+            --settings WEBSITES_PORT=$(containerPort) | Out-Null
+
+          # Restart the app
+          az webapp restart --name $(appName) --resource-group $(rgName) | Out-Null
