@@ -1,0 +1,76 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  azureSubscription: 'sc-azure-ice1'           # Service connection name
+  acrName: 'acrheramb100919492'         
+  imageName: 'webapp'                          
+  appName: 'app-service-plan-heramb-100919492'  # your web app name
+  containerPort: '8080'                        # matches Dockerfile/app
+  imageTag: '$(Build.SourceVersion)'           # use commit SHA for traceability
+  loginServer: '$(acrName).azurecr.io'
+  fullImageName: '$(loginServer)/$(imageName):$(imageTag)'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: Build_Push
+  displayName: Build & Push Image to ACR
+  jobs:
+  - job: BuildPush
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Az login (service connection) & ACR login'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr login --name $(acrName)
+
+    - task: Bash@3
+      displayName: 'Docker build'
+      inputs:
+        targetType: inline
+        script: |
+          docker build -t $(fullImageName) .
+
+    - task: Bash@3
+      displayName: 'Docker push'
+      inputs:
+        targetType: inline
+        script: |
+          docker push $(fullImageName)
+
+- stage: Deploy
+  displayName: Deploy to App Service for Containers (Linux)
+  dependsOn: Build_Push
+  jobs:
+  - job: DeployJob
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Configure App Service container & env'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          # Set container image to the one we just pushed
+          az webapp config container set \
+            --name $(appName) \
+            --resource-group rg-ice1-<firstname>-<studentid> \
+            --docker-custom-image-name $(fullImageName)
+          
+          # Ensure App Service uses the correct container port
+          az webapp config appsettings set \
+            --name $(appName) \
+            --resource-group rg-ice1-<firstname>-<studentid> \
+            --settings WEBSITES_PORT=$(containerPort)
+
+          # Restart to pull the latest container config
+          az webapp restart \
+            --name $(appName) \
+            --resource-group rg-ice1-<firstname>-<studentid>
