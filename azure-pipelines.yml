@@ -3,74 +3,102 @@ trigger:
     include:
       - main
 
+# ------------ VARIABLES (EDIT THESE) ------------
 variables:
-  azureSubscription: 'sc-azure-ice1'           # Service connection name
-  acrName: 'acrheramb100919492'         
-  imageName: 'webapp'                          
-  appName: 'app-service-plan-heramb-100919492'  # your web app name
-  containerPort: '8080'                        # matches Dockerfile/app
-  imageTag: '$(Build.SourceVersion)'           # use commit SHA for traceability
+  azureSubscription: 'sc-azure-ice1'               # your Azure RM service connection
+  rgName: 'rg-ICE1-Heramb-100919492'         # TODO: put your resource group name
+  acrName: 'acrheramb100919492'                      # your ACR name (no FQDN)
+  appName: 'app-ice1-heramb-100919492'               # TODO: must be the Web App (container) name
+  imageName: 'webapp'
+  containerPort: '8080'
+  imageTag: '$(Build.SourceVersion)'
   loginServer: '$(acrName).azurecr.io'
   fullImageName: '$(loginServer)/$(imageName):$(imageTag)'
 
+# ------------ SELF-HOSTED AGENT POOL ------------
 pool:
-  vmImage: 'ubuntu-latest'
+  name: Default        # your self-hosted agent pool name
 
 stages:
+# ---- Stage 1: Build locally with Docker and push to ACR ----
 - stage: Build_Push
-  displayName: Build & Push Image to ACR
+  displayName: Build & Push (local Docker)
   jobs:
   - job: BuildPush
+    displayName: Docker build & push
     steps:
+    - checkout: self
+
     - task: AzureCLI@2
-      displayName: 'Az login (service connection) & ACR login'
+      displayName: 'Login to ACR'
       inputs:
         azureSubscription: '$(azureSubscription)'
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
+          set -e
           az acr login --name $(acrName)
 
-    - task: Bash@3
-      displayName: 'Docker build'
-      inputs:
-        targetType: inline
-        script: |
-          docker build -t $(fullImageName) .
+    - script: |
+        set -e
+        echo "Building $(fullImageName)"
+        docker build -t "$(fullImageName)" .
+        docker push "$(fullImageName)"
+      displayName: 'Docker build & push to ACR'
 
-    - task: Bash@3
-      displayName: 'Docker push'
-      inputs:
-        targetType: inline
-        script: |
-          docker push $(fullImageName)
-
+# ---- Stage 2: Configure Web App to pull private image from ACR ----
 - stage: Deploy
-  displayName: Deploy to App Service for Containers (Linux)
+  displayName: Deploy to App Service (Linux container)
   dependsOn: Build_Push
   jobs:
   - job: DeployJob
+    displayName: Configure image, identity, AcrPull, port, restart
     steps:
     - task: AzureCLI@2
-      displayName: 'Configure App Service container & env'
+      displayName: 'Assign identity + grant AcrPull + set container + port + restart'
       inputs:
         azureSubscription: '$(azureSubscription)'
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
-          # Set container image to the one we just pushed
+          set -e
+
+          echo "Getting ACR resource ID..."
+          ACR_ID=$(az acr show -n $(acrName) --query id -o tsv)
+
+          echo "Enable system-assigned identity on Web App (idempotent)..."
+          az webapp identity assign \
+            --name $(appName) \
+            --resource-group $(rgName) >/dev/null
+
+          PRINCIPAL_ID=$(az webapp identity show \
+            --name $(appName) \
+            --resource-group $(rgName) \
+            --query principalId -o tsv)
+
+          echo "Grant AcrPull on ACR to the Web App's managed identity (safe if exists)..."
+          az role assignment create \
+            --assignee-object-id "$PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role "AcrPull" \
+            --scope "$ACR_ID" >/dev/null || echo "Role already exists; continuing."
+
+          FULL_IMAGE="$(loginServer)/$(imageName):$(imageTag)"
+          echo "Set container image to $FULL_IMAGE"
           az webapp config container set \
             --name $(appName) \
-            --resource-group rg-ice1-<firstname>-<studentid> \
-            --docker-custom-image-name $(fullImageName)
-          
-          # Ensure App Service uses the correct container port
+            --resource-group $(rgName) \
+            --docker-custom-image-name "$FULL_IMAGE"
+
+          echo "Set WEBSITES_PORT=$(containerPort)"
           az webapp config appsettings set \
             --name $(appName) \
-            --resource-group rg-ice1-<firstname>-<studentid> \
-            --settings WEBSITES_PORT=$(containerPort)
+            --resource-group $(rgName) \
+            --settings WEBSITES_PORT=$(containerPort) >/dev/null
 
-          # Restart to pull the latest container config
+          echo "Restart Web App..."
           az webapp restart \
             --name $(appName) \
-            --resource-group rg-ice1-<firstname>-<studentid>
+            --resource-group $(rgName)
+
+          echo "Done."
